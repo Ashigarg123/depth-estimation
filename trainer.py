@@ -227,26 +227,14 @@ class Trainer:
         for batch_idx, inputs in enumerate(self.train_loader):
 
             before_op_time = time.time()
-            ## use the pretrained weights mask rcnn to get ground truths 
-           # print(self.mask_rcnn(inputs))
-            #print(type(inputs)) 
-            #print(inputs)
-
-            #print("here:{}".format(self.mask_rcnn(inputs[('color_aug', 0,0)]))) 
-            ##
+           
             segment_gt = []
             for scale in range(4):
-            #    print(self.mask_rcnn(inputs[('color_aug', 0, scale)]))
-                #x = self.mask_rcnn(inputs[('color_aug', 0, scale)])['out'] 
-                #y = x[:, 1:, :, :]
-                #print(y)
-               # max_masks, _ = torch.max(y, dim=1)
-                #print(max_masks, max_masks.shape)
                 
                 for key, ipt in inputs.items():
                     inputs[key] = ipt.to(self.device)
                 segment_gt.append(self.mask_rcnn(inputs[('color_aug', 0, scale)])['out'])#[0]['masks'])
-            #print(len(segment_gt))
+         
 
             ## added 
             outputs, losses = self.process_batch(inputs, segment_gt)
@@ -463,11 +451,6 @@ class Trainer:
 
         return reprojection_loss
     
-    ## ADDED SEG LOSS
-    #def seg_loss(self, seg, segment_gt):
-        #dice = Dice(average='micro') 
-        #loss_ = dice(preds, target) 
-        #return loss_
 
     def compute_losses(self, inputs, outputs, segment_gt):
         """Compute the reprojection and smoothness losses for a minibatch
@@ -494,11 +477,7 @@ class Trainer:
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
 
             reprojection_losses = torch.cat(reprojection_losses, 1)
-            ### segmentation loss function
-        #    print("segment:{}".format(seg)) 
-         #   print("segment_gt:{}".format(segment_gt))
-           # print(type(seg), type(segment_gt[scale]))
-            #print(seg.shape, segment_gt[scale].shape)
+       
             segmentation_loss = self.seg_loss(seg, segment_gt[scale])
             if not self.opt.disable_automasking:
                 identity_reprojection_losses = []
