@@ -8,12 +8,14 @@ from __future__ import absolute_import, division, print_function
 
 import numpy as np
 import time
-
+import torch.nn as nn
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
+import torchvision 
+from torchmetrics import Dice
 
 import json
 
@@ -24,7 +26,7 @@ from layers import *
 import datasets
 import networks
 from IPython import embed
-
+from networks.seg_decoder import *
 
 class Trainer:
     def __init__(self, options):
@@ -40,6 +42,10 @@ class Trainer:
 
         self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
 
+        ### Initialize mask rcnn model with pretrained weights 
+        self.mask_rcnn = torch.hub.load('pytorch/vision:v0.10.0', 'deeplabv3_resnet50', pretrained=True)#torchvision.models.detection.maskrcnn_resnet50_fpn(pretrained=True)
+        self.mask_rcnn.to(self.device)
+        self.mask_rcnn.eval()
         self.num_scales = len(self.opt.scales)
         self.num_input_frames = len(self.opt.frame_ids)
         self.num_pose_frames = 2 if self.opt.pose_model_input == "pairs" else self.num_input_frames
@@ -60,6 +66,16 @@ class Trainer:
             self.models["encoder"].num_ch_enc, self.opt.scales)
         self.models["depth"].to(self.device)
         self.parameters_to_train += list(self.models["depth"].parameters())
+        
+
+        ## STEP 1: Add segmentation 
+
+        self.models["segment"] = SegDecoder(
+            self.models["encoder"].num_ch_enc, self.opt.scales, num_output_channels=21)
+        self.models["segment"].to(self.device)
+        self.parameters_to_train += list(self.models["segment"].parameters())
+
+
 
         if self.use_pose_net:
             if self.opt.pose_model_type == "separate_resnet":
@@ -166,6 +182,16 @@ class Trainer:
             len(train_dataset), len(val_dataset)))
 
         self.save_opts()
+    
+    def seg_loss(self, seg, segment_gt):
+
+        loss2 = nn.MSELoss()
+        loss2.to(self.device)
+        #dice = Dice(average='micro') 
+        seg = seg.to(self.device) 
+        segment_gt = segment_gt.to(self.device)
+        loss_ = loss2(seg, segment_gt) 
+        return loss_
 
     def set_train(self):
         """Convert all models to training mode
@@ -201,9 +227,30 @@ class Trainer:
         for batch_idx, inputs in enumerate(self.train_loader):
 
             before_op_time = time.time()
+            ## use the pretrained weights mask rcnn to get ground truths 
+           # print(self.mask_rcnn(inputs))
+            #print(type(inputs)) 
+            #print(inputs)
 
-            outputs, losses = self.process_batch(inputs)
+            #print("here:{}".format(self.mask_rcnn(inputs[('color_aug', 0,0)]))) 
+            ##
+            segment_gt = []
+            for scale in range(4):
+            #    print(self.mask_rcnn(inputs[('color_aug', 0, scale)]))
+                #x = self.mask_rcnn(inputs[('color_aug', 0, scale)])['out'] 
+                #y = x[:, 1:, :, :]
+                #print(y)
+               # max_masks, _ = torch.max(y, dim=1)
+                #print(max_masks, max_masks.shape)
+                
+                for key, ipt in inputs.items():
+                    inputs[key] = ipt.to(self.device)
+                segment_gt.append(self.mask_rcnn(inputs[('color_aug', 0, scale)])['out'])#[0]['masks'])
+            #print(len(segment_gt))
 
+            ## added 
+            outputs, losses = self.process_batch(inputs, segment_gt)
+            
             self.model_optimizer.zero_grad()
             losses["loss"].backward()
             self.model_optimizer.step()
@@ -225,7 +272,7 @@ class Trainer:
 
             self.step += 1
 
-    def process_batch(self, inputs):
+    def process_batch(self, inputs, segment_gt):
         """Pass a minibatch through the network and generate images and losses
         """
         for key, ipt in inputs.items():
@@ -243,10 +290,15 @@ class Trainer:
                 features[k] = [f[i] for f in all_features]
 
             outputs = self.models["depth"](features[0])
+            outputs.update(self.models["segment"](features))
         else:
             # Otherwise, we only feed the image with frame_id 0 through the depth encoder
             features = self.models["encoder"](inputs["color_aug", 0, 0])
+
             outputs = self.models["depth"](features)
+            ### Since output is a dictionary use the segmentation and same features 
+            outputs.update(self.models["segment"](features))
+            ####
 
         if self.opt.predictive_mask:
             outputs["predictive_mask"] = self.models["predictive_mask"](features)
@@ -255,7 +307,9 @@ class Trainer:
             outputs.update(self.predict_poses(inputs, features))
 
         self.generate_images_pred(inputs, outputs)
-        losses = self.compute_losses(inputs, outputs)
+
+        ## to compute losses use segmentation ground truth as well!
+        losses = self.compute_losses(inputs, outputs, segment_gt)
 
         return outputs, losses
 
@@ -322,13 +376,18 @@ class Trainer:
         """
         self.set_eval()
         try:
-            inputs = self.val_iter.next()
+            inputs = next(self.val_iter)
         except StopIteration:
             self.val_iter = iter(self.val_loader)
-            inputs = self.val_iter.next()
-
+            inputs = next(self.val_iter)
+        
         with torch.no_grad():
-            outputs, losses = self.process_batch(inputs)
+            segment_gt = []
+            for scale in range(4):
+                for key, ipt in inputs.items():
+                    inputs[key] = ipt.to(self.device)
+                segment_gt.append(self.mask_rcnn(inputs[('color_aug', 0, scale)])['out'])
+            outputs, losses = self.process_batch(inputs, segment_gt)
 
             if "depth_gt" in inputs:
                 self.compute_depth_losses(inputs, outputs, losses)
@@ -403,8 +462,14 @@ class Trainer:
             reprojection_loss = 0.85 * ssim_loss + 0.15 * l1_loss
 
         return reprojection_loss
+    
+    ## ADDED SEG LOSS
+    #def seg_loss(self, seg, segment_gt):
+        #dice = Dice(average='micro') 
+        #loss_ = dice(preds, target) 
+        #return loss_
 
-    def compute_losses(self, inputs, outputs):
+    def compute_losses(self, inputs, outputs, segment_gt):
         """Compute the reprojection and smoothness losses for a minibatch
         """
         losses = {}
@@ -420,6 +485,7 @@ class Trainer:
                 source_scale = 0
 
             disp = outputs[("disp", scale)]
+            seg = outputs[("seg", scale)]
             color = inputs[("color", 0, scale)]
             target = inputs[("color", 0, source_scale)]
 
@@ -428,7 +494,12 @@ class Trainer:
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
 
             reprojection_losses = torch.cat(reprojection_losses, 1)
-
+            ### segmentation loss function
+        #    print("segment:{}".format(seg)) 
+         #   print("segment_gt:{}".format(segment_gt))
+           # print(type(seg), type(segment_gt[scale]))
+            #print(seg.shape, segment_gt[scale].shape)
+            segmentation_loss = self.seg_loss(seg, segment_gt[scale])
             if not self.opt.disable_automasking:
                 identity_reprojection_losses = []
                 for frame_id in self.opt.frame_ids[1:]:
@@ -470,7 +541,10 @@ class Trainer:
 
                 combined = torch.cat((identity_reprojection_loss, reprojection_loss), dim=1)
             else:
-                combined = reprojection_loss
+                combined = reprojection_loss 
+            
+            ## also add segmentation loss with a lambda 
+            combined += 10e-2 * segmentation_loss
 
             if combined.shape[1] == 1:
                 to_optimise = combined
